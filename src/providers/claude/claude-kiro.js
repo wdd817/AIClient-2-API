@@ -50,9 +50,9 @@ const KIRO_CONSTANTS = {
 // Per-model context window sizes for accurate token estimation
 const MODEL_CONTEXT_TOKENS = {
     "claude-opus-4-6": 1000000,
-    "claude-opus-4-5": 1000000,
-    "claude-opus-4-5-20251101": 1000000,
-    "claude-sonnet-4-6": 200000,
+    "claude-opus-4-5": 200000,
+    "claude-opus-4-5-20251101": 200000,
+    "claude-sonnet-4-6": 1000000,
     "claude-sonnet-4-5": 200000,
     "claude-sonnet-4-5-20250929": 200000,
     "claude-haiku-4-5": 200000,
@@ -2428,8 +2428,46 @@ async saveCredentialsToFile(filePath, newData) {
 
                     // 工具调用事件（包含 name 和 toolUseId）
                     if (tc.name && tc.toolUseId) {
-                        // 遇到工具调用时，立即关闭文本块，避免前端等待到流结束才看到 content_block_stop
+                        // 遇到工具调用时，先刷新缓冲区中未发送的文本，再关闭文本块
+                        if (thinkingRequested) {
+                            let remaining = '';
+                            if (streamState.inThinking) {
+                                // 思考模式中：将剩余 buffer 作为 thinking delta 发送
+                                if (streamState.stripThinkingLeadingNewline) {
+                                    if (streamState.buffer.startsWith('\r\n')) streamState.buffer = streamState.buffer.slice(2);
+                                    else if (streamState.buffer.startsWith('\n')) streamState.buffer = streamState.buffer.slice(1);
+                                    streamState.stripThinkingLeadingNewline = false;
+                                }
+                                if (streamState.buffer) {
+                                    toolEvents.push(...createThinkingDeltaEvents(streamState.buffer));
+                                }
+                                toolEvents.push(...createThinkingDeltaEvents(""));
+                                toolEvents.push(...stopBlock(streamState.thinkingBlockIndex));
+                                streamState.buffer = '';
+                                streamState.inThinking = false;
+                                streamState.thinkingExtracted = true;
+                            } else if (!streamState.thinkingExtracted) {
+                                // 思考尚未开始：将 pendingTextBeforeThinking + buffer 作为文本发送
+                                remaining = `${streamState.pendingTextBeforeThinking}${streamState.buffer}`;
+                                streamState.pendingTextBeforeThinking = '';
+                                streamState.buffer = '';
+                            } else {
+                                // 思考已结束：将剩余 buffer 作为文本发送
+                                remaining = streamState.buffer;
+                                streamState.buffer = '';
+                                if (streamState.stripTextLeadingNewlinesAfterThinking) {
+                                    if (remaining.startsWith('\r\n\r\n')) remaining = remaining.slice(4);
+                                    else if (remaining.startsWith('\n\n')) remaining = remaining.slice(2);
+                                    streamState.stripTextLeadingNewlinesAfterThinking = false;
+                                }
+                            }
+                            if (remaining) {
+                                toolEvents.push(...createTextDeltaEvents(remaining));
+                            }
+                        }
+                        // 关闭文本块，并重置 textBlockIndex 以便后续文本可以创建新块
                         toolEvents.push(...stopBlock(streamState.textBlockIndex));
+                        streamState.textBlockIndex = null;
 
                         // 同一工具调用续传
                         if (currentToolCall && currentToolCall.toolUseId === tc.toolUseId) {
