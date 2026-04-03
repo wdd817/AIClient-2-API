@@ -150,9 +150,11 @@ function isWhitespaceOnly(text) {
 }
 
 /**
- * Find a "real" thinking end tag that is not quoted/backticked and is followed by '\n\n'.
- * This avoids prematurely closing a thinking block when the model mentions `</thinking>`
- * inside the thinking content.
+ * Find a "real" thinking end tag that is not quoted/backticked.
+ * Accepts the tag when followed by '\n\n', '\n', or end-of-buffer (for streaming scenarios
+ * where the separator may arrive in the next chunk).
+ * The stricter '\n\n' requirement previously caused the end tag to be missed when the model
+ * emitted `</thinking>\n` or `</thinking>` followed directly by text.
  */
 function findRealThinkingEndTag(buffer, startIndex = 0) {
     let searchStart = Math.max(0, startIndex);
@@ -160,7 +162,8 @@ function findRealThinkingEndTag(buffer, startIndex = 0) {
         const pos = findRealTag(buffer, KIRO_THINKING.END_TAG, searchStart);
         if (pos === -1) return -1;
         const after = buffer.slice(pos + KIRO_THINKING.END_TAG.length);
-        if (after.startsWith('\n\n')) return pos;
+        // 接受 \n\n、\n、或缓冲区末尾（后续 chunk 可能带来分隔符）
+        if (after.length === 0 || after.startsWith('\n')) return pos;
         searchStart = pos + 1;
     }
 }
@@ -1064,9 +1067,14 @@ async saveCredentialsToFile(filePath, newData) {
         let startIndex = 0;
 
         // Handle system prompt
+        // 注意：当只有一条消息时（第一条消息），不要将其加入 history，
+        // 而是将 system prompt 前缀保存下来，在构建 currentMessage 时合并。
+        // 这样避免第一条消息内容在 history 和 currentMessage 中重复出现，
+        // 同时也避免插入伪造的 "Continue" assistantResponseMessage。
+        let systemPromptPrefix = '';
         if (systemPrompt) {
-            // If the first message is a user message, prepend system prompt to it
-            if (processedMessages[0].role === 'user') {
+            if (processedMessages[0].role === 'user' && processedMessages.length > 1) {
+                // 多条消息：将 system prompt 合并到第一条 user 消息并加入 history
                 let firstUserContent = this.getContentText(processedMessages[0]);
                 history.push({
                     userInputMessage: {
@@ -1076,6 +1084,9 @@ async saveCredentialsToFile(filePath, newData) {
                     }
                 });
                 startIndex = 1; // Start processing from the second message
+            } else if (processedMessages[0].role === 'user' && processedMessages.length === 1) {
+                // 只有一条消息（第一条消息）：不加入 history，保存前缀供 currentMessage 使用
+                systemPromptPrefix = systemPrompt;
             } else {
                 // If the first message is not a user message, or if there's no initial user message,
                 // add system prompt as a standalone user message.
@@ -1302,6 +1313,11 @@ async saveCredentialsToFile(filePath, newData) {
             // Kiro API 要求 content 不能为空，即使有 toolResults
             if (!currentContent) {
                 currentContent = currentToolResults.length > 0 ? 'Tool results provided.' : 'Continue';
+            }
+
+            // 如果是第一条消息（systemPromptPrefix 非空），将 system prompt 合并到 currentContent
+            if (systemPromptPrefix) {
+                currentContent = `${systemPromptPrefix}\n\n${currentContent}`;
             }
         }
 
@@ -2287,26 +2303,36 @@ async saveCredentialsToFile(filePath, newData) {
 
             const estimatedInputTokens = this.estimateInputTokens(requestBody);
 
-            // 1. 先发送 message_start 事件
-            yield {
-                type: "message_start",
-                message: {
-                    id: messageId,
-                    type: "message",
-                    role: "assistant",
-                    model: model,
-                    usage: {
-                        input_tokens: estimatedInputTokens,
-                        output_tokens: 0,
-                        cache_creation_input_tokens: 0,
-                        cache_read_input_tokens: 0
-                    },
-                    content: []
-                }
+            // 延迟发送 message_start：先建立 Kiro API 连接，收到第一个事件后再发送
+            // 这样如果 API 调用失败（401/403/网络错误等），客户端还未收到任何数据，
+            // handleStreamRequest 可以正常重试或切换凭证，避免出现
+            // message_start 已发送但无后续内容导致客户端显示空白的问题
+            let messageStartSent = false;
+            const yieldMessageStartIfNeeded = function* () {
+                if (messageStartSent) return;
+                messageStartSent = true;
+                yield {
+                    type: "message_start",
+                    message: {
+                        id: messageId,
+                        type: "message",
+                        role: "assistant",
+                        model: model,
+                        usage: {
+                            input_tokens: estimatedInputTokens,
+                            output_tokens: 0,
+                            cache_creation_input_tokens: 0,
+                            cache_read_input_tokens: 0
+                        },
+                        content: []
+                    }
+                };
             };
 
             // 2. 流式接收并发送每个 content_block_delta
             for await (const event of this.streamApiReal('', finalModel, requestBody)) {
+                // 收到第一个事件说明 API 连接成功，安全发送 message_start
+                yield* yieldMessageStartIfNeeded();
                 if (event.type === 'contextUsage' && event.contextUsagePercentage) {
                     // 捕获上下文使用百分比（包含输入和输出的总使用量）
                     contextUsagePercentage = event.contextUsagePercentage;
@@ -2692,6 +2718,9 @@ async saveCredentialsToFile(filePath, newData) {
                 logger.warn('[Kiro Stream] contextUsagePercentage not received, using estimation');
                 inputTokens = estimatedInputTokens;
             }
+
+            // 确保 message_start 已发送（即使流为空也需要完整的消息生命周期）
+            yield* yieldMessageStartIfNeeded();
 
             // 4. 发送 message_delta 事件
             yield {
